@@ -17,7 +17,7 @@ import re
 import sys
 import time
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
 
@@ -51,10 +51,19 @@ class BaiduError(Exception):
 # Phân tích link
 # --------------------------------------------------------------------------- #
 def parse_link(link: str, pwd: str | None):
-    """Trả về (surl_đầy_đủ_có_số_1, surl_không_có_số_1, pwd)."""
+    """Trả về (surl_đầy_đủ_có_số_1, surl_không_có_số_1, pwd, thư_mục_con|None).
+
+    Thư mục con lấy từ phần fragment của link, ví dụ:
+    ...?pwd=xxxx#list/path=%2Fsharelink123-456%2F02.Cadence&parentPath=...
+    """
     u = urlparse(link.strip())
     qs = parse_qs(u.query)
     pwd = pwd or (qs.get("pwd") or [None])[0]
+
+    sub_path = None
+    m_path = re.search(r"(?:^|[/&?])path=([^&]*)", u.fragment)
+    if m_path:
+        sub_path = unquote(m_path.group(1)) or None
 
     m = re.search(r"/s/(1[\w-]+)", u.path)
     if m:
@@ -63,7 +72,7 @@ def parse_link(link: str, pwd: str | None):
         full = "1" + qs["surl"][0]
     else:
         raise BaiduError("Không nhận ra định dạng link pan.baidu.com.")
-    return full, full[1:], pwd
+    return full, full[1:], pwd, sub_path
 
 
 # --------------------------------------------------------------------------- #
@@ -176,6 +185,29 @@ class BaiduShare:
             time.sleep(self.delay)
         return items
 
+    # -- xác định thư mục bắt đầu quét -------------------------------------- #
+    def resolve_start(self, sub_path):
+        """Trả về (đường_dẫn_thật_trên_Baidu, đường_dẫn_tương_đối_so_với_gốc_share).
+
+        sub_path có thể là:
+          - đường dẫn thật:  /sharelink872451385-446348911506688/02.Cadence
+          - đường dẫn tương đối: 02.Cadence  hoặc  /02.Cadence  hoặc  A/B
+        """
+        if not sub_path:
+            return None, ""
+        sub_path = sub_path.strip()
+        m = re.match(r"^(/sharelink[^/]+)(/.*)?$", sub_path)
+        if m:  # đã là đường dẫn thật
+            return sub_path.rstrip("/"), (m.group(2) or "").rstrip("/")
+
+        # đường dẫn tương đối -> ghép với tiền tố gốc của share
+        rel = "/" + sub_path.strip("/")
+        root_items = self.list_dir(None)
+        if not root_items:
+            raise BaiduError("Không đọc được thư mục gốc của link để xác định đường dẫn.")
+        prefix = root_items[0]["path"].rsplit("/", 1)[0]
+        return prefix + rel, rel
+
     # -- duyệt đệ quy ------------------------------------------------------- #
     def crawl(self, real_path=None, rel_path=""):
         nodes = []
@@ -233,10 +265,11 @@ def render_tree(nodes, prefix="") -> list[str]:
     return lines
 
 
-def build_report(link, surl, tree, n_files, n_dirs):
+def build_report(link, surl, tree, n_files, n_dirs, start_path=""):
     return {
         "source": link,
         "short_url": "1" + surl,
+        "start_path": start_path or "/",
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "total_files": n_files,
         "total_folders": n_dirs,
@@ -255,6 +288,7 @@ def write_json(report, path):
 def write_txt(report, path):
     head = [
         f"Nguồn        : {report['source']}",
+        f"Thư mục quét : {report['start_path']}",
         f"Xuất lúc     : {report['exported_at']}",
         f"Số tệp       : {report['total_files']}",
         f"Số thư mục   : {report['total_folders']}",
@@ -276,6 +310,9 @@ def main():
     ap.add_argument("-f", "--format", choices=["txt", "json", "both"], default=None,
                     help="Định dạng xuất (mặc định: suy ra từ -o, nếu không thì json)")
     ap.add_argument("-o", "--output", help="Tên file xuất (đuôi .txt/.json)")
+    ap.add_argument("-d", "--path", help="Chỉ quét 1 thư mục con. Có thể là đường dẫn tương đối "
+                    "(vd: 02.Cadence hoặc A/B) hoặc đường dẫn thật /sharelinkXXX/... "
+                    "(mặc định: tự lấy từ phần #list/path=... của link nếu có)")
     ap.add_argument("--cookie", help="Chuỗi cookie Baidu (tuỳ chọn, ví dụ BDUSS=...; STOKEN=...)")
     ap.add_argument("--delay", type=float, default=0.4, help="Giây nghỉ giữa các request (mặc định 0.4)")
     ap.add_argument("-q", "--quiet", action="store_true", help="Không in tiến trình")
@@ -283,22 +320,26 @@ def main():
 
     link = args.link or input("Nhập link Baidu Pan: ").strip()
     try:
-        full, surl, pwd = parse_link(link, args.pwd)
+        full, surl, pwd, sub = parse_link(link, args.pwd)
+        sub = args.path or sub  # --path ưu tiên hơn phần #list/path= trong link
         if not pwd and not args.link:
             pwd = input("Nhập mã trích xuất (Enter nếu không có): ").strip() or None
+        if not sub and not args.link:
+            sub = input("Chỉ quét thư mục con? Nhập đường dẫn (Enter = quét toàn bộ): ").strip() or None
         if not args.format and not args.output and not args.link:
             args.format = (input("Xuất định dạng [json/txt/both] (mặc định json): ").strip() or "json")
 
         client = BaiduShare(full, surl, pwd, cookie=args.cookie,
                             delay=args.delay, verbose=not args.quiet)
         client.verify()
-        client.log("Đang quét danh sách...")
-        tree = client.crawl()
+        real_start, rel_start = client.resolve_start(sub)
+        client.log(f"Đang quét: {rel_start or '/ (toàn bộ link)'}")
+        tree = client.crawl(real_start, rel_start)
     except (BaiduError, requests.RequestException) as e:
         print(f"Lỗi: {e}", file=sys.stderr)
         sys.exit(1)
 
-    report = build_report(link, surl, tree, client.n_files, client.n_dirs)
+    report = build_report(link, surl, tree, client.n_files, client.n_dirs, rel_start)
 
     # Xác định định dạng & tên file
     fmt = args.format
@@ -306,7 +347,13 @@ def main():
     if base and not fmt:
         fmt = "txt" if base.lower().endswith(".txt") else "json"
     fmt = fmt or "json"
-    stem = re.sub(r"\.(txt|json)$", "", base, flags=re.I) if base else f"baidu_{surl}"
+    if base:
+        stem = re.sub(r"\.(txt|json)$", "", base, flags=re.I)
+    else:
+        stem = f"baidu_{surl}"
+        if rel_start:
+            tail = re.sub(r'[\\/:*?"<>|\s]+', "_", rel_start.strip("/").replace("/", "_"))
+            stem += f"_{tail}"
 
     outs = []
     if fmt in ("json", "both"):
